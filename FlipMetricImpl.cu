@@ -4,6 +4,7 @@
 
 #include <thrust/adjacent_difference.h>
 #include <thrust/binary_search.h>
+#include <thrust/transform.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
 
@@ -208,40 +209,6 @@ __global__ void __cuFlip_generateSpatialFilter(Color* output, unsigned int width
     }
 }
 
-__global__ void __cuFlip_convolve(const Color* input, unsigned int imageWidth, unsigned int imageHeight, const Color* filter, unsigned int filterWidth, unsigned int filterHeight, Color* output) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-
-    int halfFilterWidth = filterWidth / 2;
-    int halfFilterHeight = filterHeight / 2;
-
-    unsigned int imagePixelsCount = imageWidth * imageHeight;
-
-    for (unsigned int i = index; i < imagePixelsCount; i += stride) {
-        int x = i % imageWidth;
-        int y = i / imageWidth;
-
-        Color sum = {0.0f, 0.0f, 0.0f};
-
-        for (int yf = -halfFilterHeight; yf <= halfFilterHeight; yf++) {
-            int yy = __cuFlip_min(__cuFlip_max(0, y + yf), imageHeight - 1);
-            for (int xf = -halfFilterWidth; xf <= halfFilterWidth; xf++) {
-                int xx = __cuFlip_min(__cuFlip_max(0, x + xf), imageWidth - 1);
-                const Color& s = input[yy * imageWidth + xx];
-                const Color& w = filter[(yf + halfFilterHeight) * filterWidth + xf + halfFilterWidth];
-                sum.x += s.x * w.x;
-                sum.y += s.y * w.y;
-                sum.z += s.z * w.z;
-            }
-        }
-
-        Color& out = output[i];
-        out.x = sum.x;
-        out.y = sum.y;
-        out.z = sum.z;
-    }
-}
-
 __global__ void __cuFlip_computeColorDifference(const Color* reference, const Color* test, Color* output, unsigned int pixelsCount) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -321,6 +288,85 @@ __global__ void __cuFlip_computeFlipError(const Color* colorDifference, const Co
     }
 }
 
+__global__ void __cuFlip_hwc2chw(const Color* input, float* output, unsigned int pixelsCount) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (unsigned int i = index; i < pixelsCount; i += stride) {
+        output[i + pixelsCount * 0] = input[i].x;
+        output[i + pixelsCount * 1] = input[i].y;
+        output[i + pixelsCount * 2] = input[i].z;
+    }
+}
+
+__global__ void __cuFlip_chw2hwc(const float* input, Color* output, unsigned int pixelsCount) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (unsigned int i = index; i < pixelsCount; i += stride) {
+        output[i].x = input[i + pixelsCount * 0];
+        output[i].y = input[i + pixelsCount * 1];
+        output[i].z = input[i + pixelsCount * 2];
+    }
+}
+
+FlipMetricImpl::Filter::Filter(cudnnHandle_t cudnnHandle, cudnnTensorDescriptor_t inputDescriptor, cudnnTensorDescriptor_t outputDescriptor, unsigned int width, unsigned int height) {
+    m_hwc.resize(width * height);
+    m_chw.resize(width * height * 3);
+
+    cudnnCreateFilterDescriptor(&m_filterDescriptor);
+    cudnnSetFilter4dDescriptor(m_filterDescriptor, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 3, 1, height, width);
+
+    cudnnCreateConvolutionDescriptor(&m_convolutionDescriptor);
+    cudnnSetConvolution2dDescriptor(m_convolutionDescriptor, height / 2, width / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
+
+    int count;
+    cudnnFindConvolutionForwardAlgorithm(cudnnHandle, inputDescriptor, m_filterDescriptor, m_convolutionDescriptor, outputDescriptor, 1, &count, &m_convolutionAlgorithm);
+
+    cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle, inputDescriptor, m_filterDescriptor, m_convolutionDescriptor, outputDescriptor, m_convolutionAlgorithm.algo, &m_workspaceSize);
+
+    cudaMalloc(&m_workspace, m_workspaceSize);
+}
+
+FlipMetricImpl::Filter::~Filter() {
+    cudnnDestroyFilterDescriptor(m_filterDescriptor);
+    cudnnDestroyConvolutionDescriptor(m_convolutionDescriptor);
+    cudaFree(&m_workspace);
+}
+
+cudnnFilterDescriptor_t FlipMetricImpl::Filter::getFilterDescriptor() {
+    return m_filterDescriptor;
+}
+
+cudnnConvolutionDescriptor_t FlipMetricImpl::Filter::getConvolutionDescriptor() {
+    return m_convolutionDescriptor;
+}
+
+cudnnConvolutionFwdAlgo_t FlipMetricImpl::Filter::getConvolutionAlgorithm() {
+    return m_convolutionAlgorithm.algo;
+}
+
+void* FlipMetricImpl::Filter::getWorkspace() {
+    return m_workspace;
+}
+
+size_t FlipMetricImpl::Filter::getWorkspaceSize() {
+    return m_workspaceSize;
+}
+
+FlipMetricImpl::ColorVec& FlipMetricImpl::Filter::getDataHWC() {
+    return m_hwc;
+}
+
+thrust::device_vector<float>& FlipMetricImpl::Filter::getDataCHW() {
+    return m_chw;
+}
+
+void FlipMetricImpl::Filter::toCHW() {
+    __cuFlip_hwc2chw<<<128, 4>>>(thrust::raw_pointer_cast(m_hwc.data()), thrust::raw_pointer_cast(m_chw.data()), m_hwc.size());
+    cudaDeviceSynchronize();
+}
+
 float FlipMetricImpl::gaussian(const float x, const float y, const float sigma) {
     return expf(-(x * x + y * y) / (2.0f * sigma * sigma));
 }
@@ -349,8 +395,20 @@ void FlipMetricImpl::generateSpatialFilter(ColorVec& output, unsigned int width,
     __cuFlip_generateSpatialFilter<<<128, 4>>>(thrust::raw_pointer_cast(output.data()), width, radius, deltaX);
 }
 
-void FlipMetricImpl::convolve(const thrust::device_vector<Color>& image, unsigned int imageWidth, unsigned int imageHeight, const thrust::device_vector<Color>& filter, unsigned int filterWidth, unsigned int filterHeight, thrust::device_vector<Color>& output) {
-    __cuFlip_convolve<<<128, 4>>>(thrust::raw_pointer_cast(image.data()), imageWidth, imageHeight, thrust::raw_pointer_cast(filter.data()), filterWidth, filterHeight, thrust::raw_pointer_cast(output.data()));
+void FlipMetricImpl::convolve(const std::shared_ptr<Filter>& filter, const ColorVec& input, ColorVec& output) {
+    __cuFlip_hwc2chw<<<128, 4>>>(thrust::raw_pointer_cast(input.data()), thrust::raw_pointer_cast(m_chwInput.data()), input.size());
+    cudaDeviceSynchronize();
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cudnnConvolutionForward(m_cudnnHandle,
+                            &alpha, m_inputDescriptor, thrust::raw_pointer_cast(m_chwInput.data()),
+                            filter->getFilterDescriptor(), thrust::raw_pointer_cast(filter->getDataCHW().data()),
+                            filter->getConvolutionDescriptor(), filter->getConvolutionAlgorithm(),
+                            filter->getWorkspace(), filter->getWorkspaceSize(),
+                            &beta, m_outputDescriptor, thrust::raw_pointer_cast(m_chwOutput.data()));
+    __cuFlip_chw2hwc<<<128, 4>>>(thrust::raw_pointer_cast(m_chwOutput.data()), thrust::raw_pointer_cast(output.data()), output.size());
+    cudaDeviceSynchronize();
 }
 
 void FlipMetricImpl::computeColorDifference(const ColorVec& reference, const ColorVec& test, ColorVec& output) {
@@ -375,17 +433,22 @@ void FlipMetricImpl::createColorFilter() {
     float maxScaleParameter = std::max(std::max(std::max(b1.x, b1.y), std::max(b1.z, b2.x)), std::max(b2.y, b2.z));
     int radius = int(std::ceil(3.0f * sqrtf(maxScaleParameter / (2.0f * pi_sq)) * m_ppd));
 
-    m_colorFilterWidth = 2 * radius + 1;
-    m_colorFilter.resize(m_colorFilterWidth * m_colorFilterWidth);
-    generateSpatialFilter(m_colorFilter, m_colorFilterWidth, radius, deltaX);
+    unsigned int width = 2 * radius + 1;
+    m_colorFilter = std::make_shared<Filter>(m_cudnnHandle, m_inputDescriptor, m_outputDescriptor, width, width);
+
+    ColorVec& filterData = m_colorFilter->getDataHWC();
+
+    generateSpatialFilter(filterData, width, radius, deltaX);
     cudaDeviceSynchronize();
 
-    Color totalFilterColor = thrust::reduce(m_colorFilter.begin(), m_colorFilter.end(), Color{0.0f, 0.0f, 0.0f});
-    normalize(m_colorFilter, m_colorFilter, totalFilterColor);
+    Color totalFilterColor = thrust::reduce(filterData.begin(), filterData.end(), Color{0.0f, 0.0f, 0.0f});
+    normalize(filterData, filterData, totalFilterColor);
     cudaDeviceSynchronize();
+
+    m_colorFilter->toCHW();
 }
 
-void FlipMetricImpl::createDetectionFilter(thrust::device_vector<Color>& output, float stdDev, float radius, int width, bool pointDetector) {
+void FlipMetricImpl::createDetectionFilter(ColorVec& output, float stdDev, float radius, int width, bool pointDetector) {
     float weightX, weightY;
     float negativeWeightsSumX = 0.0f;
     float positiveWeightsSumX = 0.0f;
@@ -435,20 +498,23 @@ void FlipMetricImpl::createDetectionFilters() {
     const float stdDev = 0.5f * gw * m_ppd;
     const int radius = int(std::ceil(3.0f * stdDev));
 
-    m_featureFilterWidth = 2 * radius + 1;
+    unsigned int width = 2 * radius + 1;
 
-    m_edgesFilter.resize(m_featureFilterWidth * m_featureFilterWidth);
-    m_pointsFilter.resize(m_featureFilterWidth * m_featureFilterWidth);
+    m_edgesFilter = std::make_shared<Filter>(m_cudnnHandle, m_inputDescriptor, m_outputDescriptor, width, width);
+    m_pointsFilter = std::make_shared<Filter>(m_cudnnHandle, m_inputDescriptor, m_outputDescriptor, width, width);
 
-    createDetectionFilter(m_edgesFilter, stdDev, radius, m_featureFilterWidth, false);
-    createDetectionFilter(m_pointsFilter, stdDev, radius, m_featureFilterWidth, true);
+    createDetectionFilter(m_edgesFilter->getDataHWC(), stdDev, radius, width, false);
+    m_edgesFilter->toCHW();
+
+    createDetectionFilter(m_pointsFilter->getDataHWC(), stdDev, radius, width, true);
+    m_pointsFilter->toCHW();
 }
 
-void FlipMetricImpl::preprocess(ColorVec& image, ColorVec& imageGray, const ColorVec& colorFilter) {
+void FlipMetricImpl::preprocess(ColorVec& image, ColorVec& imageGray) {
     YCxCz2Gray(image, imageGray);
     cudaDeviceSynchronize();
 
-    convolve(image, m_imageWidth, m_imageHeight, colorFilter, m_colorFilterWidth, m_colorFilterWidth, image);
+    convolve(m_colorFilter, image, image);
     cudaDeviceSynchronize();
 
     YCxCz2CIELab(image, image);
@@ -463,6 +529,14 @@ FlipMetricImpl::FlipMetricImpl(const unsigned char* image, unsigned int width, u
     m_imageWidth = width;
     m_imageHeight = height;
 
+    cudnnCreate(&m_cudnnHandle);
+
+    cudnnCreateTensorDescriptor(&m_inputDescriptor);
+    cudnnSetTensor4dDescriptor(m_inputDescriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 3, m_imageHeight, m_imageWidth);
+
+    cudnnCreateTensorDescriptor(&m_outputDescriptor);
+    cudnnSetTensor4dDescriptor(m_outputDescriptor, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 3, m_imageHeight, m_imageWidth);
+
     createColorFilter();
     createDetectionFilters();
 
@@ -472,10 +546,15 @@ FlipMetricImpl::FlipMetricImpl(const unsigned char* image, unsigned int width, u
     m_testGrayPixels.resize(m_imageWidth * m_imageHeight);
     m_colorDifference.resize(m_imageWidth * m_imageHeight);
     m_featureDifference.resize(m_imageWidth * m_imageHeight);
+
     m_edgesReference.resize(m_imageWidth * m_imageHeight);
     m_edgesTest.resize(m_imageWidth * m_imageHeight);
     m_pointsReference.resize(m_imageWidth * m_imageHeight);
     m_pointsTest.resize(m_imageWidth * m_imageHeight);
+
+    m_chwInput.resize(m_imageWidth * m_imageHeight * 3);
+    m_chwOutput.resize(m_imageWidth * m_imageHeight * 3);
+
     m_flip.resize(m_imageWidth * m_imageHeight);
     m_histogram.resize(100);
     m_histogramSeq.resize(m_histogram.size());
@@ -486,10 +565,13 @@ FlipMetricImpl::FlipMetricImpl(const unsigned char* image, unsigned int width, u
     sRGB2YCxCz(thrust::raw_pointer_cast(imageDevice.data()), m_referencePixels);
     cudaDeviceSynchronize();
 
-    preprocess(m_referencePixels, m_referenceGrayPixels, m_colorFilter);
+    preprocess(m_referencePixels, m_referenceGrayPixels);
 }
 
 FlipMetricImpl::~FlipMetricImpl() {
+    cudnnDestroyTensorDescriptor(m_inputDescriptor);
+    cudnnDestroyTensorDescriptor(m_outputDescriptor);
+    cudnnDestroy(m_cudnnHandle);
 }
 
 float getWeightedPercentile(const thrust::device_vector<float> histogram, const double percent) {
@@ -523,47 +605,31 @@ float getWeightedPercentile(const thrust::device_vector<float> histogram, const 
     double percentile = (weightedMedianIndex + linearWeight) * bucketStep;
     return percentile;
 }
-#include <chrono>
+
 float FlipMetricImpl::compareDevice(const unsigned char* image) {
-    auto now = std::chrono::system_clock::now();
     sRGB2YCxCz(image, m_testPixels);
     cudaDeviceSynchronize();
 
-    std::cout << "timeA: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;;
-
-    preprocess(m_testPixels, m_testGrayPixels, m_colorFilter);
-
-    std::cout << "timeB: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;;
+    preprocess(m_testPixels, m_testGrayPixels);
 
     computeColorDifference(m_referencePixels, m_testPixels, m_colorDifference);
-    convolve(m_referenceGrayPixels, m_imageWidth, m_imageHeight, m_edgesFilter, m_featureFilterWidth, m_featureFilterWidth, m_edgesReference);
-    convolve(m_testGrayPixels, m_imageWidth, m_imageHeight, m_edgesFilter, m_featureFilterWidth, m_featureFilterWidth, m_edgesTest);
-    convolve(m_referenceGrayPixels, m_imageWidth, m_imageHeight, m_pointsFilter, m_featureFilterWidth, m_featureFilterWidth, m_pointsReference);
-    convolve(m_testGrayPixels, m_imageWidth, m_imageHeight, m_pointsFilter, m_featureFilterWidth, m_featureFilterWidth, m_pointsTest);
+    convolve(m_edgesFilter, m_referenceGrayPixels, m_edgesReference);
+    convolve(m_edgesFilter, m_testGrayPixels, m_edgesTest);
+    convolve(m_pointsFilter, m_referenceGrayPixels, m_pointsReference);
+    convolve(m_pointsFilter, m_testGrayPixels, m_pointsTest);
     cudaDeviceSynchronize();
-
-    std::cout << "time0: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;;
 
     computeFeatureDifference(m_edgesReference, m_edgesTest, m_pointsReference, m_pointsTest, m_featureDifference);
     cudaDeviceSynchronize();
 
-    std::cout << "time1: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;;
-
     computeFlipError(m_colorDifference, m_featureDifference, m_flip);
     cudaDeviceSynchronize();
-
-    std::cout << "time2: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;;
 
     thrust::sort(m_flip.begin(), m_flip.end());
     thrust::upper_bound(m_flip.begin(), m_flip.end(), m_histogramSeq.begin(), m_histogramSeq.end(), m_histogram.begin());
     thrust::adjacent_difference(m_histogram.begin(), m_histogram.end(), m_histogram.begin());
 
-    std::cout << "time3: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;;
-
-    float res = getWeightedPercentile(m_histogram, 0.5f);
-    std::cout << "time4: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - now).count() << std::endl;;
-
-    return res;
+    return getWeightedPercentile(m_histogram, 0.5f);
 }
 
 float FlipMetricImpl::compareHost(const unsigned char* image) {
